@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>格闘ゲーム - レトロドット</title>
+    <style>
+      :root {
+        --bg: #0f0f1a;
+        --scanline: rgba(255, 255, 255, 0.03);
+        --ui: #e6e6e6;
+        --accent: #ff3b30;
+        --accent-dim: #5a1c1c;
+        --enemy: #ff4141;
+        --player: #4cc9f0;
+        --ground: #2b2b38;
+        --sky1: #1a1a28;
+        --sky2: #12121c;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ui);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        place-items: center;
+        gap: 8px;
+      }
+
+      header,
+      footer {
+        font-size: 12px;
+        letter-spacing: 0.5px;
+        opacity: 0.8;
+        text-align: center;
+        user-select: none;
+      }
+
+      main {
+        width: 100%;
+        display: grid;
+        place-items: center;
+      }
+
+      .frame {
+        position: relative;
+        padding: 12px;
+        background: #0a0a12;
+        border: 4px solid #2a2a3a;
+        border-radius: 6px;
+        box-shadow: 0 0 0 2px #0a0a12, 0 0 24px rgba(0, 0, 0, 0.6) inset;
+      }
+
+      canvas {
+        display: block;
+        width: min(92vw, 768px);
+        height: auto;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        background: linear-gradient(var(--sky1), var(--sky2));
+      }
+
+      /* Subtle CRT scanline + vignette for retro feel */
+      .fx::after {
+        content: "";
+        position: absolute;
+        inset: 12px;
+        pointer-events: none;
+        background:
+          repeating-linear-gradient(
+            to bottom,
+            transparent 0px,
+            transparent 2px,
+            var(--scanline) 2px,
+            var(--scanline) 3px
+          );
+        mix-blend-mode: overlay;
+      }
+      .fx::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(
+          80% 70% at 50% 50%,
+          transparent 0%,
+          rgba(0, 0, 0, 0.15) 70%,
+          rgba(0, 0, 0, 0.4) 100%
+        );
+      }
+    </style>
+  </head>
+  <body>
+    <header aria-hidden="true">レトロ・ドット格闘（単一ラウンド）</header>
+    <main>
+      <div class="frame fx" aria-live="polite">
+        <canvas id="game" width="192" height="108" aria-label="格闘ゲームのプレイ画面"></canvas>
+      </div>
+    </main>
+    <footer>
+      操作: Enter開始 / ←→移動 / Space小ジャンプ / Zパンチ（敵HP5）
+    </footer>
+
+    <script>
+      // Retro pixel canvas setup
+      const canvas = document.getElementById("game");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const WIDTH = canvas.width; // 192
+      const HEIGHT = canvas.height; // 108
+
+      // Game state
+      const STATE = { TITLE: 0, PLAYING: 1, WIN: 2 };
+      let state = STATE.TITLE;
+
+      // Controls
+      const keys = { left: false, right: false, jump: false, punch: false };
+      let justPressedPunch = false;
+
+      // Timing
+      let last = 0;
+      const dtFixed = 1 / 60;
+      let acc = 0;
+
+      // World
+      const groundY = HEIGHT - 16;
+      const gravity = 420; // px/s^2 in low-res world
+      const moveSpeed = 80; // px/s
+      const jumpVel = 160; // px/s
+
+      // Player
+      const player = {
+        x: 40,
+        y: groundY - 16,
+        vx: 0,
+        vy: 0,
+        w: 10,
+        h: 16,
+        face: 1, // 1 right, -1 left
+        punching: 0, // frames remaining
+        canHitId: 0, // punch id for single-hit detection
+      };
+      let punchId = 0;
+
+      // Enemy
+      const enemy = {
+        x: 140,
+        y: groundY - 16,
+        vx: 0,
+        vy: 0,
+        w: 10,
+        h: 16,
+        hp: 5,
+        maxHp: 5,
+        wobble: 0,
+      };
+
+      // Prevent page scroll on game keys
+      window.addEventListener(
+        "keydown",
+        (e) => {
+          if (["ArrowLeft", "ArrowRight", " ", "Space", "Enter"].includes(e.key)) {
+            e.preventDefault();
+          }
+        },
+        { passive: false }
+      );
+
+      // Input handling
+      window.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          if (state === STATE.TITLE || state === STATE.WIN) startGame();
+        }
+        if (state !== STATE.PLAYING) return;
+        if (e.key === "ArrowLeft") keys.left = true;
+        if (e.key === "ArrowRight") keys.right = true;
+        if (e.key === " " || e.key === "Space") keys.jump = true;
+        if (e.key.toLowerCase() === "z") {
+          if (!keys.punch) justPressedPunch = true;
+          keys.punch = true;
+        }
+      });
+      window.addEventListener("keyup", (e) => {
+        if (e.key === "ArrowLeft") keys.left = false;
+        if (e.key === "ArrowRight") keys.right = false;
+        if (e.key === " " || e.key === "Space") keys.jump = false;
+        if (e.key.toLowerCase() === "z") keys.punch = false;
+      });
+
+      function startGame() {
+        state = STATE.PLAYING;
+        // reset entities
+        player.x = 40;
+        player.y = groundY - 16;
+        player.vx = 0;
+        player.vy = 0;
+        player.face = 1;
+        player.punching = 0;
+        enemy.x = 140;
+        enemy.y = groundY - 16;
+        enemy.vx = 0;
+        enemy.vy = 0;
+        enemy.hp = enemy.maxHp;
+        enemy.wobble = 0;
+      }
+
+      // Game loop
+      function frame(ts) {
+        if (!last) last = ts;
+        let delta = (ts - last) / 1000;
+        if (delta > 0.1) delta = 0.1; // clamp to avoid spiral
+        last = ts;
+        acc += delta;
+
+        while (acc >= dtFixed) {
+          update(dtFixed);
+          acc -= dtFixed;
+        }
+        draw();
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      function update(dt) {
+        if (state !== STATE.PLAYING) return;
+
+        // Player horizontal
+        player.vx = 0;
+        if (keys.left) player.vx -= moveSpeed;
+        if (keys.right) player.vx += moveSpeed;
+        if (player.vx !== 0) player.face = Math.sign(player.vx);
+
+        // Player jump
+        const onGround = player.y + player.h >= groundY;
+        if (keys.jump && onGround) {
+          player.vy = -jumpVel;
+        }
+
+        // Gravity
+        player.vy += gravity * dt;
+        // Integrate
+        player.x += player.vx * dt;
+        player.y += player.vy * dt;
+        // Ground collision
+        if (player.y + player.h > groundY) {
+          player.y = groundY - player.h;
+          player.vy = 0;
+        }
+        // Walls
+        player.x = Math.max(8, Math.min(WIDTH - 8 - player.w, player.x));
+
+        // Punch
+        if (justPressedPunch) {
+          player.punching = 10; // frames
+          player.canHitId = ++punchId;
+        }
+        justPressedPunch = false;
+        if (player.punching > 0) {
+          player.punching--;
+
+          // Active hit frames 3-6
+          const active = player.punching <= 7 && player.punching >= 4;
+          if (active) {
+            const range = 8; // reach
+            const ax = player.face === 1 ? player.x + player.w : player.x - range;
+            const ay = player.y + 4;
+            const aw = range;
+            const ah = 8;
+            if (aabb(ax, ay, aw, ah, enemy.x, enemy.y, enemy.w, enemy.h)) {
+              // Apply damage once per punch id
+              if (enemy._lastHitId !== player.canHitId) {
+                enemy._lastHitId = player.canHitId;
+                enemy.hp = Math.max(0, enemy.hp - 1);
+                enemy.vx = player.face * 40;
+                enemy.vy = -40;
+                enemy.wobble = 10;
+                if (enemy.hp <= 0) {
+                  state = STATE.WIN;
+                }
+              }
+            }
+          }
+        }
+
+        // Enemy simple behavior: light drift and recover from hit
+        enemy.vy += gravity * dt;
+        // light horizontal AI: keep some distance from edges
+        const targetVx = Math.sin(perfNow() / 900) * 20;
+        enemy.vx += (targetVx - enemy.vx) * 0.02;
+        enemy.x += enemy.vx * dt;
+        enemy.y += enemy.vy * dt;
+        if (enemy.y + enemy.h > groundY) {
+          enemy.y = groundY - enemy.h;
+          enemy.vy = 0;
+        }
+        enemy.x = Math.max(8, Math.min(WIDTH - 8 - enemy.w, enemy.x));
+        if (enemy.wobble > 0) enemy.wobble--;
+      }
+
+      function draw() {
+        // Clear
+        ctx.fillStyle = "#10101a";
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        // Background stars/pixels for retro ambience
+        drawBackdrop();
+
+        // Ground
+        drawGround();
+
+        // Title / Win overlays
+        if (state === STATE.TITLE) {
+          drawTitle();
+        }
+
+        // Entities
+        drawEnemy();
+        drawPlayer();
+
+        // UI
+        drawUI();
+
+        if (state === STATE.WIN) {
+          drawWin();
+        }
+      }
+
+      function drawBackdrop() {
+        // Dithered sky blocks
+        for (let y = 0; y < groundY; y += 6) {
+          for (let x = (y % 12) / 2; x < WIDTH; x += 12) {
+            ctx.fillStyle = y < groundY / 2 ? "#171727" : "#141423";
+            ctx.fillRect(x, y, 2, 2);
+          }
+        }
+        // Pixel clouds
+        ctx.fillStyle = "#202037";
+        drawBox(30, 18, 24, 6);
+        drawBox(48, 14, 18, 5);
+        drawBox(120, 24, 26, 6);
+      }
+
+      function drawGround() {
+        ctx.fillStyle = "#222231";
+        ctx.fillRect(0, groundY, WIDTH, HEIGHT - groundY);
+        // Simple checker for texture
+        for (let y = groundY; y < HEIGHT; y += 4) {
+          for (let x = (y % 8) / 2; x < WIDTH; x += 8) {
+            ctx.fillStyle = "#2b2b38";
+            ctx.fillRect(x, y, 2, 2);
+          }
+        }
+      }
+
+      function drawTitle() {
+        const t = Math.floor(perfNow() / 400) % 2 === 0;
+        centerText("格闘ゲーム", HEIGHT / 2 - 18, "#e6e6e6", 2);
+        centerText("Enterで開始", HEIGHT / 2 + 2, t ? "#ffea00" : "#c7c7c7", 1);
+        centerText("←→移動 / Spaceジャンプ / Zパンチ", HEIGHT / 2 + 16, "#aaa", 1);
+      }
+
+      function drawWin() {
+        centerText("K.O.!", HEIGHT / 2 - 10, "#ff4141", 2);
+        centerText("勝利! Enterでリスタート", HEIGHT / 2 + 8, "#e6e6e6", 1);
+      }
+
+      function drawPlayer() {
+        const px = Math.round(player.x);
+        const py = Math.round(player.y);
+
+        // Body colors
+        const skin = "#ffd6a0";
+        const suit = "#4cc9f0";
+        const dark = "#2b7ea1";
+
+        // Legs animate on move
+        const step = Math.sin(perfNow() / 120 + px * 0.1) * (Math.abs(player.vx) > 0 ? 1 : 0);
+
+        // Shadow
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(px - 1, groundY + 1, player.w + 2, 2);
+
+        // Torso
+        ctx.fillStyle = suit;
+        drawBox(px, py + 6, 10, 6);
+        ctx.fillStyle = dark;
+        drawBox(px + 1, py + 7, 8, 1);
+
+        // Head
+        ctx.fillStyle = skin;
+        drawBox(px + 3, py, 4, 4);
+        // Eyes
+        ctx.fillStyle = "#222";
+        if (player.face === 1) {
+          drawBox(px + 6, py + 2, 1, 1);
+        } else {
+          drawBox(px + 2, py + 2, 1, 1);
+        }
+
+        // Legs
+        ctx.fillStyle = dark;
+        drawBox(px + 1, py + 12, 3, 4 + (step > 0 ? 1 : 0));
+        drawBox(px + 6, py + 12, 3, 4 + (step < 0 ? 1 : 0));
+
+        // Arms / Punch
+        ctx.fillStyle = suit;
+        // Base arms
+        drawBox(px - 2, py + 7, 2, 3);
+        drawBox(px + 10, py + 7, 2, 3);
+
+        if (player.punching > 0) {
+          // Extend punching arm toward facing
+          const extend = 5;
+          if (player.face === 1) {
+            drawBox(px + 12, py + 7, extend, 3);
+            // fist
+            ctx.fillStyle = "#ffd6a0";
+            drawBox(px + 12 + extend, py + 7, 2, 3);
+          } else {
+            ctx.fillStyle = suit;
+            drawBox(px - (extend + 2), py + 7, extend, 3);
+            ctx.fillStyle = "#ffd6a0";
+            drawBox(px - (extend + 4), py + 7, 2, 3);
+          }
+        }
+      }
+
+      function drawEnemy() {
+        const ex = Math.round(enemy.x);
+        const ey = Math.round(enemy.y);
+        const wob = enemy.wobble > 0 ? (enemy.wobble % 2 === 0 ? 1 : -1) : 0;
+        const body = "#ff6b6b";
+        const dark = "#a13333";
+        const skin = "#f5c59f";
+
+        // Shadow
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(ex - 1, groundY + 1, enemy.w + 2, 2);
+
+        // Torso
+        ctx.fillStyle = body;
+        drawBox(ex + wob, ey + 6, 10, 6);
+        ctx.fillStyle = dark;
+        drawBox(ex + 1 + wob, ey + 7, 8, 1);
+
+        // Head
+        ctx.fillStyle = skin;
+        drawBox(ex + 3 + wob, ey, 4, 4);
+        ctx.fillStyle = "#222";
+        drawBox(ex + 2 + wob, ey + 2, 1, 1);
+
+        // Legs
+        ctx.fillStyle = dark;
+        drawBox(ex + 1 + wob, ey + 12, 3, 4);
+        drawBox(ex + 6 + wob, ey + 12, 3, 4);
+
+        // Arms
+        ctx.fillStyle = body;
+        drawBox(ex - 2 + wob, ey + 7, 2, 3);
+        drawBox(ex + 10 + wob, ey + 7, 2, 3);
+      }
+
+      function drawUI() {
+        // Enemy HP gauge (5 blocks)
+        const gaugeX = Math.floor((WIDTH - 60) / 2);
+        const gaugeY = 4;
+        // Label
+        text("ENEMY", gaugeX - 28, gaugeY + 4, "#c7c7c7", 1);
+        for (let i = 0; i < enemy.maxHp; i++) {
+          const x = gaugeX + i * 12;
+          ctx.fillStyle = i < enemy.hp ? "#ff4141" : "#5a1c1c";
+          drawBox(x, gaugeY, 10, 6);
+          ctx.fillStyle = "#00000033";
+          drawBox(x + 1, gaugeY + 4, 8, 1);
+        }
+
+        // Controls hint
+        if (state === STATE.PLAYING) {
+          const blink = Math.floor(perfNow() / 600) % 2 === 0;
+          text(
+            blink ? "Z=パンチ" : "Space=ジャンプ",
+            6,
+            HEIGHT - 10,
+            "#9aa",
+            1
+          );
+        }
+      }
+
+      // Helpers
+      function aabb(x1, y1, w1, h1, x2, y2, w2, h2) {
+        return x1 < x2 + w2 && x2 < x1 + w1 && y1 < y2 + h2 && y2 < y1 + h1;
+      }
+
+      function drawBox(x, y, w, h) {
+        ctx.fillRect(Math.floor(x), Math.floor(y), Math.floor(w), Math.floor(h));
+      }
+
+      function text(str, x, y, color = "#fff", scale = 1) {
+        // Simple pixel text using 1px rectangles from built-in 3x5 font map
+        ctx.fillStyle = color;
+        const px = Math.floor(x);
+        const py = Math.floor(y);
+        drawTinyText(ctx, str, px, py, scale);
+      }
+
+      function centerText(str, y, color = "#fff", scale = 1) {
+        const width = measureTinyText(str) * scale;
+        const x = Math.floor((WIDTH - width) / 2);
+        text(str, x, y, color, scale);
+      }
+
+      function perfNow() {
+        return performance.now();
+      }
+
+      // 3x5 tiny pixel font (A-Z 0-9 basic punctuation)
+      const FONT = (() => {
+        const map = new Map();
+        const def = (ch, rows) => map.set(ch, rows);
+        const R = (s) => s.split("\n").map((r) => r.trim());
+        // Uppercase letters and digits (3x5). '#' = on, '.' = off.
+        def("A", R(`.##.
+                      #..#
+                      ####
+                      #..#
+                      #..#`));
+        def("B", R(`###.
+                      #..#
+                      ###.
+                      #..#
+                      ###.`));
+        def("C", R(`.###
+                      #...
+                      #...
+                      #...
+                      .###`));
+        def("D", R(`###.
+                      #..#
+                      #..#
+                      #..#
+                      ###.`));
+        def("E", R(`####
+                      #...
+                      ###.
+                      #...
+                      ####`));
+        def("F", R(`####
+                      #...
+                      ###.
+                      #...
+                      #...`));
+        def("G", R(`.###
+                      #...
+                      #.##
+                      #..#
+                      .###`));
+        def("H", R(`#..#
+                      #..#
+                      ####
+                      #..#
+                      #..#`));
+        def("I", R(`.##.
+                      .##.
+                      .##.
+                      .##.
+                      .##.`));
+        def("J", R(`..##
+                      ..##
+                      ..##
+                      #.##
+                      .#..`));
+        def("K", R(`#..#
+                      #.#.
+                      ##..
+                      #.#.
+                      #..#`));
+        def("L", R(`#...
+                      #...
+                      #...
+                      #...
+                      ####`));
+        def("M", R(`#..#
+                      ####
+                      ####
+                      #..#
+                      #..#`));
+        def("N", R(`#..#
+                      ###.
+                      ###.
+                      #.##
+                      #..#`));
+        def("O", R(`.##.
+                      #..#
+                      #..#
+                      #..#
+                      .##.`));
+        def("P", R(`###.
+                      #..#
+                      ###.
+                      #...
+                      #...`));
+        def("Q", R(`.##.
+                      #..#
+                      #..#
+                      #.##
+                      .###`));
+        def("R", R(`###.
+                      #..#
+                      ###.
+                      #.#.
+                      #..#`));
+        def("S", R(`.###
+                      #...
+                      .##.
+                      ...#
+                      ###.`));
+        def("T", R(`####
+                      .##.
+                      .##.
+                      .##.
+                      .##.`));
+        def("U", R(`#..#
+                      #..#
+                      #..#
+                      #..#
+                      .##.`));
+        def("V", R(`#..#
+                      #..#
+                      #..#
+                      .##.
+                      .##.`));
+        def("W", R(`#..#
+                      #..#
+                      ####
+                      ####
+                      #..#`));
+        def("X", R(`#..#
+                      .##.
+                      .##.
+                      .##.
+                      #..#`));
+        def("Y", R(`#..#
+                      .##.
+                      .##.
+                      .##.
+                      .##.`));
+        def("Z", R(`####
+                      ..#.
+                      .#..
+                      #...
+                      ####`));
+        def("0", R(`.##.
+                      #..#
+                      #..#
+                      #..#
+                      .##.`));
+        def("1", R(`..#.
+                      .##.
+                      ..#.
+                      ..#.
+                      .###`));
+        def("2", R(`###.
+                      ...#
+                      .##.
+                      #...
+                      ####`));
+        def("3", R(`###.
+                      ...#
+                      .##.
+                      ...#
+                      ###.`));
+        def("4", R(`#..#
+                      #..#
+                      ####
+                      ...#
+                      ...#`));
+        def("5", R(`####
+                      #...
+                      ###.
+                      ...#
+                      ###.`));
+        def("6", R(`.###
+                      #...
+                      ###.
+                      #..#
+                      .##.`));
+        def("7", R(`####
+                      ..#.
+                      .#..
+                      #...
+                      #...`));
+        def("8", R(`.##.
+                      #..#
+                      .##.
+                      #..#
+                      .##.`));
+        def("9", R(`.##.
+                      #..#
+                      .###
+                      ...#
+                      ###.`));
+        def(" ", R(`....
+                      ....
+                      ....
+                      ....
+                      ....`));
+        def("-", R(`....
+                      ....
+                      ####
+                      ....
+                      ....`));
+        def("!", R(`.##.
+                      .##.
+                      .##.
+                      ....
+                      .##.`));
+        def("/", R(`...#
+                      ..#.
+                      .#..
+                      #...
+                      ....`));
+        return map;
+      })();
+
+      function drawTinyText(ctx, str, x, y, scale = 1) {
+        const sx = Math.floor(scale);
+        let cx = x;
+        for (const ch of str.toUpperCase()) {
+          const rows = FONT.get(ch) || FONT.get(" ");
+          for (let ry = 0; ry < rows.length; ry++) {
+            const row = rows[ry];
+            for (let rx = 0; rx < row.length; rx++) {
+              if (row[rx] === "#") {
+                ctx.fillRect(cx + rx * sx, y + ry * sx, sx, sx);
+              }
+            }
+          }
+          cx += (rows[0]?.length || 4) * sx + 1 * sx; // 1px spacing
+        }
+      }
+
+      function measureTinyText(str) {
+        let width = 0;
+        for (const ch of str.toUpperCase()) {
+          const rows = FONT.get(ch) || FONT.get(" ");
+          width += (rows[0]?.length || 4) + 1; // include spacing
+        }
+        return width - 1; // trailing space removal
+      }
+    </script>
+  </body>
+  </html>
+
